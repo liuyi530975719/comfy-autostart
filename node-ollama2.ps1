@@ -22,8 +22,11 @@
        FLASH_ATTENTION=1 / KV_CACHE_TYPE=q8_0 (what the labeling pool needs), kept alive across reboots:
          - box WITH the autostart kit (C:\waifumaster-autostart): "ollama" block in autostart.config.json +
            launcher v3 (= v2 + env block), WaifumasterAutostart task restarted, ComfyUI untouched
-         - box WITHOUT it (pro6000): C:\waifumaster-ollama\start_ollama.ps1 + ollama_keepalive.ps1 and a
-           scheduled task "WaifumasterOllama" (SYSTEM, at boot + every 2 min), same shape deploy-extras.ps1 makes
+         - box WITHOUT it (pro6000): one scheduled task per GPU "WaifumasterOllamaGpu<N>" (SYSTEM, at boot,
+           restarts itself, runs C:\waifumaster-ollama\scripts\ollama_gpu<N>.ps1 = env + 'ollama serve') plus the
+           keepalive task "WaifumasterOllama" (every 2 min: re-starts the task of any port that stopped answering).
+           Any OTHER scheduled task that starts ollama (an old unpinned "OllamaServe" etc.) is stopped + disabled
+           (Enable-ScheduledTask <name> to undo), because it would keep killing/grabbing :11434.
     5. makes sure the labeling model exists (shared models dir, pulled once) and warms every instance
     6. Cloudflare (needs the API token: Tunnel:Edit, DNS:Edit, Access Apps:Edit, Zone:Read):
          finds this box's tunnel from the DNS of <Chat>.<Zone>, adds <Chat>2.<Zone> -> :11435 (and so on)
@@ -135,11 +138,20 @@ function Update-Ollama() {
     if (-not $got) { return $false }
     Say "installing silently (/VERYSILENT; the installer closes any running Ollama itself; 1-3 minutes) ..." 'Yellow'
     $setupArgs = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
-    $code = -1
-    if ($env:WM_TEST_RUNNER) { & $env:WM_TEST_RUNNER $setup @setupArgs | Out-Host; $code = $LASTEXITCODE }   # tests only
-    else { $p = Start-Process -FilePath $setup -ArgumentList $setupArgs -Wait -PassThru; $code = $p.ExitCode }
+    # NOT 'Start-Process -Wait': that also waits for every descendant, and the installer launches the tray app
+    # ('ollama app.exe', never exits) on its way out -> the script would hang right here. Poll the installer itself.
+    if ($env:WM_TEST_RUNNER) { $p = Start-Process -FilePath $env:WM_TEST_RUNNER -ArgumentList (@($setup) + $setupArgs) -PassThru -NoNewWindow }   # tests only
+    else { $p = Start-Process -FilePath $setup -ArgumentList $setupArgs -PassThru }
+    $t0 = Get-Date; $lastSay = $t0
+    while (-not $p.HasExited) {
+        Start-Sleep -Seconds 2
+        if (((Get-Date) - $lastSay).TotalSeconds -ge 30) { Say ("  installer still running ({0:N0} s) ..." -f ((Get-Date) - $t0).TotalSeconds) 'DarkGray'; $lastSay = Get-Date }
+        if (((Get-Date) - $t0).TotalSeconds -gt 1500) { Say "installer still running after 25 min -- not waiting any longer (check Task Manager for OllamaSetup.exe)" 'Yellow'; return $false }
+    }
+    $code = $p.ExitCode
     if ($code -ne 0) { Say "installer exit code $code" 'Yellow'; return $false }
-    Start-Sleep -Seconds 8     # the installer launches the tray app on its way out; let it settle, step 2 stops it again
+    Say "installed (the tray app it started is stopped again in step 2)" 'Cyan'
+    Start-Sleep -Seconds 5
     return $true
 }
 if (-not $CfOnly) {
@@ -200,11 +212,18 @@ if (-not $ModelsDir -and -not $cfg) {
     $ModelsDir = Join-Path $env:USERPROFILE '.ollama\models'
     Say "models dir: $ModelsDir (this user's Ollama models, reused by the pinned instances)"
 }
-# other scheduled tasks that (re)start an unpinned ollama would fight over :11434 -- say so
-try {
-    $others = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -notin @('WaifumasterOllama', 'WaifumasterAutostart') -and (@($_.Actions) | Where-Object { "$($_.Execute) $($_.Arguments)" -match 'ollama' }).Count -gt 0 })
-    foreach ($o in $others) { Say "WARNING: scheduled task '$($o.TaskName)' also starts ollama ($($o.State)) -- disable it if it brings back an unpinned instance on :11434" 'Yellow' }
-} catch {}
+# other scheduled tasks that (re)start an unpinned ollama fight over :11434 (pro6000 had "OllamaServe": kills whatever
+# listens on 11434, starts its own on 127.0.0.1) -> stop + disable them (not deleted; Enable-ScheduledTask <name> to undo)
+$others = @()
+try { $others = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -notmatch '^Waifumaster' -and (@($_.Actions) | Where-Object { "$($_.Execute) $($_.Arguments)" -match 'ollama' }).Count -gt 0 }) } catch {}
+foreach ($o in $others) {
+    try {
+        Stop-ScheduledTask -TaskName $o.TaskName -TaskPath $o.TaskPath -ErrorAction SilentlyContinue
+        Disable-ScheduledTask -TaskName $o.TaskName -TaskPath $o.TaskPath -ErrorAction Stop | Out-Null
+        Say "disabled scheduled task '$($o.TaskName)' (it also starts ollama: $(@($o.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) -join ' ')) -- Enable-ScheduledTask '$($o.TaskName)' to undo" 'Yellow'
+    } catch { Say "WARNING: could not disable scheduled task '$($o.TaskName)' ($($_.Exception.Message)) -- it will fight our instances for :11434" 'Red' }
+}
+if ($others.Count) { Get-Process -Name 'ollama app', 'ollama' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2 }
 
 if ($cfg) {
 # ============================================================ 3. config block (autostart kit)
@@ -216,7 +235,7 @@ $new['ollama'] = [ordered]@{
     keep_alive   = '30m'
     num_parallel = $NumParallel
     max_loaded   = $MaxLoaded
-    env          = [ordered]@{ OLLAMA_CONTEXT_LENGTH = "$ContextLength"; OLLAMA_FLASH_ATTENTION = '1'; OLLAMA_KV_CACHE_TYPE = 'q8_0' }
+    env          = [ordered]@{ OLLAMA_CONTEXT_LENGTH = "$ContextLength"; OLLAMA_FLASH_ATTENTION = '1'; OLLAMA_KV_CACHE_TYPE = 'q8_0'; OLLAMA_ORIGINS = '*' }
     instances    = $oinst
 }
 Copy-Item $CfgPath ($CfgPath + '.bak.' + (Get-Date -Format 'yyyyMMddHHmmss')) -Force
@@ -358,49 +377,91 @@ Start-ScheduledTask -TaskName $Task
 Say "restarted task $Task (ComfyUI instances untouched)" 'Green'
 $LogHint = "$KitDir\logs\ollama_gpu<gpu>_<port>.log"
 } else {
-# ============================================================ 3+4. standalone: own launcher + keepalive task (no kit on this box)
+# ============================================================ 3+4. standalone: one scheduled task per GPU + keepalive (no kit on this box)
+# Why tasks and not Start-Process: on pro6000 instances launched from a SYSTEM task via 'cmd /c ... ollama serve' never
+# came up (empty logs), while a scheduled task running 'powershell -File <wrapper that does & ollama serve>' as SYSTEM
+# demonstrably works there (that is how the old OllamaServe task ran). So: wrapper script + task per GPU.
 $Root = 'C:\waifumaster-ollama'
 $scripts = Join-Path $Root 'scripts'; $logs = Join-Path $Root 'logs'
 New-Item -ItemType Directory -Force -Path $scripts, $logs | Out-Null
-$sb = New-Object System.Text.StringBuilder
-[void]$sb.AppendLine('# Auto-generated by node-ollama2.ps1 -- one Ollama per GPU (pinned with CUDA_VISIBLE_DEVICES). Re-run node-ollama2.ps1 to change.')
-[void]$sb.AppendLine("`$Exe = '$OllamaExe'")
-[void]$sb.AppendLine("`$Logs = '$logs'")
+$taskOf = @{}      # port -> task name
 foreach ($oi in $oinst) {
     $g = [int]$oi.gpu; $port = [int]$oi.port
-    $sets = "set CUDA_VISIBLE_DEVICES=$g&& set OLLAMA_HOST=0.0.0.0:$port&& set OLLAMA_MODELS=$ModelsDir&& set OLLAMA_NUM_PARALLEL=$NumParallel&& set OLLAMA_MAX_LOADED_MODELS=$MaxLoaded&& set OLLAMA_KEEP_ALIVE=30m&& set OLLAMA_CONTEXT_LENGTH=$ContextLength&& set OLLAMA_FLASH_ATTENTION=1&& set OLLAMA_KV_CACHE_TYPE=q8_0&& "
-    [void]$sb.AppendLine("# ----- GPU $g  port $port -----")
-    [void]$sb.AppendLine("`$log = Join-Path `$Logs 'ollama_gpu$g.log'")
-    [void]$sb.AppendLine("`$inner = '$sets' + '`"' + `$Exe + '`" serve 1>>`"' + `$log + '`" 2>>`"' + `$log + '`"'")
-    [void]$sb.AppendLine("`$alive = `$false; try { Invoke-RestMethod 'http://127.0.0.1:$port/api/version' -TimeoutSec 3 | Out-Null; `$alive = `$true } catch {}")
-    [void]$sb.AppendLine("if (`$alive) { Write-Host 'Ollama gpu $g already up on :$port' } else {")
-    [void]$sb.AppendLine("  Start-Process -FilePath cmd.exe -ArgumentList ('/c ' + `$inner) -WindowStyle Hidden")
-    [void]$sb.AppendLine("  Write-Host 'started Ollama gpu $g on :$port'")
-    [void]$sb.AppendLine('  Start-Sleep -Seconds 3')
-    [void]$sb.AppendLine('}')
+    $tn = "WaifumasterOllamaGpu$g"; $taskOf[$port] = $tn
+    $wrap = Join-Path $scripts "ollama_gpu$g.ps1"
+    $log = Join-Path $logs "ollama_gpu$g.log"
+    $w = New-Object System.Text.StringBuilder
+    [void]$w.AppendLine("# Auto-generated by node-ollama2.ps1 -- Ollama pinned to GPU $g on :$port (scheduled task $tn, SYSTEM). Re-run node-ollama2.ps1 to change.")
+    [void]$w.AppendLine("`$ErrorActionPreference = 'SilentlyContinue'")
+    [void]$w.AppendLine("`$log = '$log'")
+    [void]$w.AppendLine("try { if ((Get-Item `$log).Length -gt 50MB) { Move-Item `$log (`$log + '.1') -Force } } catch {}")
+    [void]$w.AppendLine("# whatever already listens on our port (tray app, unpinned instance) has to go")
+    [void]$w.AppendLine("`$ids = @((Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue).OwningProcess | Sort-Object -Unique)")
+    [void]$w.AppendLine("foreach (`$id in `$ids) { if (`$id -and `$id -ne `$PID) { Stop-Process -Id `$id -Force } }")
+    [void]$w.AppendLine("Start-Sleep -Seconds 1")
+    [void]$w.AppendLine("`$env:CUDA_VISIBLE_DEVICES    = '$g'")
+    [void]$w.AppendLine("`$env:OLLAMA_HOST             = '0.0.0.0:$port'")
+    [void]$w.AppendLine("`$env:OLLAMA_ORIGINS          = '*'")
+    [void]$w.AppendLine("`$env:OLLAMA_MODELS           = '$ModelsDir'")
+    [void]$w.AppendLine("`$env:OLLAMA_NUM_PARALLEL     = '$NumParallel'")
+    [void]$w.AppendLine("`$env:OLLAMA_MAX_LOADED_MODELS = '$MaxLoaded'")
+    [void]$w.AppendLine("`$env:OLLAMA_KEEP_ALIVE       = '30m'")
+    [void]$w.AppendLine("`$env:OLLAMA_CONTEXT_LENGTH   = '$ContextLength'")
+    [void]$w.AppendLine("`$env:OLLAMA_FLASH_ATTENTION  = '1'")
+    [void]$w.AppendLine("`$env:OLLAMA_KV_CACHE_TYPE    = 'q8_0'")
+    [void]$w.AppendLine("Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] starting ollama serve on :$port (gpu $g, task $tn)')")
+    [void]$w.AppendLine("& '$OllamaExe' serve *>> `$log")
+    [void]$w.AppendLine("Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] ollama serve exited')")
+    [void]$w.AppendLine("exit 1   # serve never returns on purpose; returning = failure -> Task Scheduler restarts the task (RestartInterval 1 min)")
+    if (Test-Path $wrap) { Copy-Item $wrap ($wrap + '.bak.' + (Get-Date -Format 'yyyyMMddHHmmss')) -Force }
+    $w.ToString() | Out-File -Encoding ascii $wrap
+    $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$wrap`""
+    $trg = New-ScheduledTaskTrigger -AtStartup
+    $prin = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest
+    $set = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1)
+    $old = Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
+    if ($old) { Stop-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue | Out-Null }
+    Register-ScheduledTask -TaskName $tn -Action $act -Trigger $trg -Principal $prin -Settings $set -Description "Ollama pinned to GPU $g on :$port for wifemaker labeling (node-ollama2.ps1)" | Out-Null
+    Say "wrote   : $wrap  + task $tn (SYSTEM, at boot, auto-restart; gpu $g -> :$port, parallel $NumParallel, ctx $ContextLength, kv q8_0, models $ModelsDir)" 'Cyan'
 }
+# start_ollama.ps1: (re)start the task of every instance whose port is dead; ollama_keepalive.ps1 = the same, every 2 min
 $startOllama = Join-Path $scripts 'start_ollama.ps1'
-if (Test-Path $startOllama) { Copy-Item $startOllama ($startOllama + '.bak.' + (Get-Date -Format 'yyyyMMddHHmmss')) -Force }
-$sb.ToString() | Out-File -Encoding ascii $startOllama
-Say "wrote   : $startOllama ($($oinst.Count) instance(s), parallel $NumParallel, ctx $ContextLength, kv q8_0, models $ModelsDir)" 'Cyan'
-$kick = Join-Path $scripts 'ollama_keepalive.ps1'
-$portList = (($oinst | ForEach-Object { [int]$_.port }) -join ',')
+$mapLines = ($oinst | ForEach-Object { "    $([int]$_.port) = '$($taskOf[[int]$_.port])'" }) -join "`n"
 @"
-# Auto-generated by node-ollama2.ps1. Every 2 min: start any Ollama instance whose port is not answering.
-`$ports = @($portList)
-`$dead = @()
-foreach (`$p in `$ports) { try { Invoke-RestMethod "http://127.0.0.1:`$p/api/version" -TimeoutSec 5 | Out-Null } catch { `$dead += `$p } }
-if (`$dead.Count -gt 0) { & '$startOllama' }
-"@ | Out-File -Encoding ascii $kick
+# Auto-generated by node-ollama2.ps1. (Re)starts the scheduled task of every Ollama instance whose port is not answering.
+`$map = @{
+$mapLines
+}
+foreach (`$p in @(`$map.Keys | Sort-Object)) {
+    `$ok = `$false; try { Invoke-RestMethod "http://127.0.0.1:`$p/api/version" -TimeoutSec 5 | Out-Null; `$ok = `$true } catch {}
+    if (`$ok) { Write-Host "Ollama :`$p up"; continue }
+    `$tn = `$map[`$p]
+    `$t = Get-ScheduledTask -TaskName `$tn -ErrorAction SilentlyContinue
+    if (-not `$t) { Write-Host "task `$tn missing -- re-run node-ollama2.ps1"; continue }
+    if (`$t.State -eq 'Running') {
+        `$age = 999; try { `$age = ((Get-Date) - (Get-ScheduledTaskInfo -TaskName `$tn).LastRunTime).TotalSeconds } catch {}
+        if (`$age -lt 90) { Write-Host "task `$tn started `$([int]`$age)s ago, giving it time"; continue }
+        Stop-ScheduledTask -TaskName `$tn -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2
+    }
+    Start-ScheduledTask -TaskName `$tn -ErrorAction SilentlyContinue
+    Write-Host "started task `$tn for :`$p"
+}
+"@ | Out-File -Encoding ascii $startOllama
+$kick = Join-Path $scripts 'ollama_keepalive.ps1'
+"# Auto-generated by node-ollama2.ps1. Every 2 min: re-start the task of any Ollama instance whose port is not answering.`n& '$startOllama' | Out-Null`n" | Out-File -Encoding ascii $kick
 $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$kick`""
 $trg1 = New-ScheduledTaskTrigger -AtStartup
 $trg2 = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 2) -RepetitionDuration (New-TimeSpan -Days 3650)
 $prin = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest
-$set  = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew
+$set  = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew
 Unregister-ScheduledTask -TaskName 'WaifumasterOllama' -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-Register-ScheduledTask -TaskName 'WaifumasterOllama' -Action $act -Trigger @($trg1, $trg2) -Principal $prin -Settings $set -Description 'Ollama per GPU for wifemaker labeling (keepalive every 2 min)' | Out-Null
-Start-ScheduledTask -TaskName 'WaifumasterOllama'
-Say "task WaifumasterOllama registered + started (SYSTEM, at boot + every 2 min)" 'Green'
+Register-ScheduledTask -TaskName 'WaifumasterOllama' -Action $act -Trigger @($trg1, $trg2) -Principal $prin -Settings $set -Description 'Ollama per GPU for wifemaker labeling: keepalive every 2 min (node-ollama2.ps1)' | Out-Null
+Say "task WaifumasterOllama registered (keepalive, SYSTEM, at boot + every 2 min)" 'Green'
+# go: nothing of ours may still be listening, then one task per GPU
+Get-Process -Name 'ollama app', 'ollama' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 1
+foreach ($oi in $oinst) { Start-ScheduledTask -TaskName $taskOf[[int]$oi.port]; Start-Sleep -Seconds 2 }
+Say ("started : {0}" -f (($oinst | ForEach-Object { $taskOf[[int]$_.port] }) -join ', ')) 'Green'
 $LogHint = "$logs\ollama_gpu<gpu>.log"
 }
 
@@ -527,7 +588,11 @@ if ($NoCf -or -not $CfToken) {
     function Set-CfDns([string]$Zid, [string]$HostName, [string]$Tid) {
         $target = "$Tid.cfargotunnel.com"
         $recs = @(Get-CfResult 'GET' "/zones/$Zid/dns_records" $null @{ name = $HostName }) | Where-Object { $_ -and $_.name -and $_.name.ToLower() -eq $HostName }
-        if ($recs.Count -lt 1) { $null = Get-CfResult 'POST' "/zones/$Zid/dns_records" @{ type = 'CNAME'; name = $HostName; content = $target; proxied = $true; ttl = 1 }; CfLog ("dns      {0,-36} CNAME -> {1} (created)" -f $HostName, $target); return }
+        if ($recs.Count -lt 1) {
+            try { $null = Get-CfResult 'POST' "/zones/$Zid/dns_records" @{ type = 'CNAME'; name = $HostName; content = $target; proxied = $true; ttl = 1 }; CfLog ("dns      {0,-36} CNAME -> {1} (created)" -f $HostName, $target) }
+            catch { if ("$($_.Exception.Message)" -match '8105[37]|already exists') { CfLog ("dns      {0,-36} exists (not readable with this token -- it lacks Zone > DNS > Read?)" -f $HostName) } else { throw } }
+            return
+        }
         $r = $recs[0]
         if ($r.type -ne 'CNAME') { CfLog ("dns      {0,-36} has a {1} record -- NOT touched" -f $HostName, $r.type); return }
         if ($r.content -eq $target -and $r.proxied) { CfLog ("dns      {0,-36} ok" -f $HostName); return }
@@ -545,7 +610,7 @@ if ($NoCf -or -not $CfToken) {
             if ($s.PathName -match '--config\s+"?([^"]+?\.ya?ml)"?') { $conf = $Matches[1] }
             return @{ kind = 'service'; name = $s.Name; path = [string]$s.PathName; config = $conf }
         }
-        $tasks = @(); try { $tasks = @(Get-ScheduledTask -ErrorAction Stop) } catch {}
+        $tasks = @(); try { $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue) } catch {}
         foreach ($tk in $tasks) {
             foreach ($ac in @($tk.Actions)) {
                 if ("$($ac.Execute) $($ac.Arguments)" -match 'cloudflared') {
@@ -583,10 +648,33 @@ if ($NoCf -or -not $CfToken) {
         CfLog "zone $Zone -> $zid (account $acct)"
         $firstHost = $hostOf[[int]$oinst[0].port]
         if (-not $TunnelId) {
-            $recs = @(Get-CfResult 'GET' "/zones/$zid/dns_records" $null @{ name = $firstHost }) | Where-Object { $_ -and $_.type -eq 'CNAME' -and $_.content -match '^([0-9a-f-]{36})\.cfargotunnel\.com$' }
-            if ($recs.Count) { $TunnelId = ($recs[0].content -replace '\.cfargotunnel\.com$', '') }
+            # 1. the DNS record of the first host is a CNAME <uuid>.cfargotunnel.com
+            $dnsAll = @(Get-CfResult 'GET' "/zones/$zid/dns_records" $null @{ name = $firstHost }) | Where-Object { $_ }
+            $recs = @($dnsAll | Where-Object { $_.type -eq 'CNAME' -and $_.content -match '^([0-9a-f-]{36})\.cfargotunnel\.com$' })
+            if ($recs.Count) { $TunnelId = ($recs[0].content -replace '\.cfargotunnel\.com$', ''); CfLog "tunnel id from the DNS of $firstHost" }
+            else { CfLog ("dns lookup of {0}: {1} record(s){2}" -f $firstHost, $dnsAll.Count, $(if ($dnsAll.Count) { ' -- ' + (($dnsAll | ForEach-Object { "$($_.type) $($_.content)" }) -join ', ') } else { ' (none visible: no record, or the token lacks Zone > DNS > Read on this zone)' })) }
         }
-        if (-not $TunnelId) { throw "could not find this box's tunnel from the DNS of $firstHost -- pass -TunnelId <uuid> (Zero Trust -> Networks -> Tunnels)" }
+        if (-not $TunnelId) {
+            # 2. the remote-managed tunnel whose ingress routes the first host
+            $all = @(Get-CfPaged "/accounts/$acct/cfd_tunnel" @{ is_deleted = 'false' })
+            foreach ($t in $all) {
+                if (-not $t -or [string]$t.config_src -ne 'cloudflare') { continue }
+                $c = $null; try { $c = Get-CfResult 'GET' "/accounts/$acct/cfd_tunnel/$($t.id)/configurations" -Ok404 } catch { continue }
+                $hs = @(); if ($c -and $c.config -and $c.config.ingress) { foreach ($e in @($c.config.ingress)) { if ($e.hostname) { $hs += ([string]$e.hostname).ToLower() } } }
+                if ($hs -contains $firstHost.ToLower()) { $TunnelId = [string]$t.id; CfLog "tunnel id from the ingress of tunnel '$($t.name)' (routes $firstHost)"; break }
+            }
+        }
+        if (-not $TunnelId) {
+            # 3. the local cloudflared: --token <jwt> (remote-managed) or --config <yml> (locally-managed)
+            $run = Find-CloudflaredRunner
+            if ($run.path -match '--token\s+"?([A-Za-z0-9_\-=]+)') {
+                try { $tok = $Matches[1]; $pad = $tok.Replace('-', '+').Replace('_', '/'); while ($pad.Length % 4) { $pad += '=' }; $j = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($pad)) | ConvertFrom-Json; if ($j.t) { $TunnelId = [string]$j.t; CfLog "tunnel id from the local cloudflared service token" } } catch {}
+            } elseif ($run.config -and (Test-Path $run.config)) {
+                $m = Select-String -Path $run.config -Pattern '^\s*tunnel:\s*([0-9a-f-]{36})' | Select-Object -First 1
+                if ($m) { $TunnelId = $m.Matches[0].Groups[1].Value; CfLog "tunnel id from $($run.config)" }
+            }
+        }
+        if (-not $TunnelId) { throw "could not find this box's tunnel (DNS of $firstHost, tunnel ingress, local cloudflared) -- pass -TunnelId <uuid> (Zero Trust -> Networks -> Tunnels)" }
         $tun = Get-CfResult 'GET' "/accounts/$acct/cfd_tunnel/$TunnelId"
         $src = [string]$tun.config_src
         CfLog "tunnel   $($tun.name) ($TunnelId) config_src=$src status=$($tun.status)"
@@ -597,11 +685,15 @@ if ($NoCf -or -not $CfToken) {
             # remote-managed: merge into the tunnel configuration (keep every existing rule as-is)
             $cur = Get-CfResult 'GET' "/accounts/$acct/cfd_tunnel/$TunnelId/configurations" -Ok404
             $conf = [ordered]@{}; if ($cur -and $cur.config) { $conf = ToHash $cur.config }
-            $ing = @(); $seen = @{}
-            if ($conf.Contains('ingress')) { foreach ($e in @($conf['ingress'])) { if ($e -and $e.Contains('hostname') -and $e['hostname']) { $ing += ,$e; $seen[([string]$e['hostname']).ToLower()] = $true } } }
+            $ing = @(); $seen = @{}; $tmplHdr = ''
+            if ($conf.Contains('ingress')) { foreach ($e in @($conf['ingress'])) { if ($e -and $e.Contains('hostname') -and $e['hostname']) { $ing += ,$e; $seen[([string]$e['hostname']).ToLower()] = $true
+                if (([string]$e['hostname']).ToLower() -eq $firstHost.ToLower() -and $e.Contains('originRequest') -and $e['originRequest'] -and $e['originRequest'].Contains('httpHostHeader')) { $tmplHdr = [string]$e['originRequest']['httpHostHeader'] } } } }
             foreach ($h in ($newMap.Keys | Sort-Object)) {
                 if ($seen.ContainsKey($h)) { CfLog ("ingress  {0,-36} already routed" -f $h); continue }
-                $ing += ,([ordered]@{ hostname = $h; service = $newMap[$h] }); CfLog ("ingress  {0,-36} -> {1} (added)" -f $h, $newMap[$h])
+                $entry = [ordered]@{ hostname = $h; service = $newMap[$h] }
+                # mirror the first host's Host-header rewrite (e.g. 127.0.0.1:11434 -> 127.0.0.1:11435) so every instance is reached the same way
+                if ($tmplHdr -match '^(.*:)\d+$' -and $newMap[$h] -match ':(\d+)$') { $entry['originRequest'] = [ordered]@{ httpHostHeader = $Matches[1] }; $entry['originRequest']['httpHostHeader'] = ($tmplHdr -replace ':\d+$', (':' + ($newMap[$h] -replace '^.*:', ''))) }
+                $ing += ,$entry; CfLog ("ingress  {0,-36} -> {1} (added{2})" -f $h, $newMap[$h], $(if ($entry.Contains('originRequest')) { ', host header ' + $entry['originRequest']['httpHostHeader'] } else { '' }))
             }
             $ing += ,([ordered]@{ service = 'http_status:404' })
             $conf['ingress'] = $ing
@@ -627,7 +719,7 @@ if ($NoCf -or -not $CfToken) {
                 else { CfLog "restart cloudflared by hand so it reads the new config.yml" }
             }
         }
-        foreach ($h in ($newMap.Keys | Sort-Object)) { Set-CfDns $zid $h $TunnelId }
+        foreach ($h in ($newMap.Keys | Sort-Object)) { try { Set-CfDns $zid $h $TunnelId } catch { CfLog ("dns      {0,-36} FAILED: {1}" -f $h, $_.Exception.Message) } }
         $app = Find-CfAccessApp $acct $Zone $firstHost $AccessApp
         if ($app) { $null = Add-CfAccessHosts $acct $app @($newMap.Keys | Sort-Object) }
         else { CfLog "access   no self-hosted Access app found for $Zone -- add the hostnames to the fleet app in the dashboard" }
