@@ -9,11 +9,14 @@
   Run in an ADMIN PowerShell on the box (pro6000: GPU0 = pro6000a + 6000chat :11434, GPU1 = pro6000b + 6000chat2 :11435):
 
       powershell -ExecutionPolicy Bypass -File .\node-ollama2.ps1          # asks for the Cloudflare token (hidden paste)
-      & ([scriptblock]::Create((irm https://raw.githubusercontent.com/liuyi530975719/comfy-autostart/main/node-ollama2.ps1)))   # same, straight from GitHub
-      (-CfToken '<token>' also works, but then the token lands in the PowerShell history)
+      straight from GitHub (one line):
+      iwr https://raw.githubusercontent.com/liuyi530975719/comfy-autostart/main/node-ollama2.ps1 -OutFile "$env:TEMP\node-ollama2.ps1"; powershell -ExecutionPolicy Bypass -File "$env:TEMP\node-ollama2.ps1"
+      (-CfToken '<token>' also works, but then the token lands in the PowerShell history.
+       Do NOT run it as  & ([scriptblock]::Create((irm ...)))  -- a scriptblock's 'exit' closes the whole console.)
 
   What it does (idempotent, re-run any time):
-    1. checks ollama.exe (>= 0.34.4 for Qwen 3.8) and counts GPUs (nvidia-smi)
+    1. checks ollama.exe (>= 0.34.4 for Qwen 3.8; older = downloads the latest OllamaSetup.exe and installs it
+       silently, models/settings are kept; -NoUpgrade to refuse) and counts GPUs (nvidia-smi)
     2. stops the tray Ollama and takes it out of Startup (it would grab :11434 unpinned on every boot)
     3+4. one pinned instance per GPU: gpu0 -> :11434, gpu1 -> :11435, ... with OLLAMA_CONTEXT_LENGTH=16384 /
        FLASH_ATTENTION=1 / KV_CACHE_TYPE=q8_0 (what the labeling pool needs), kept alive across reboots:
@@ -38,6 +41,7 @@
                           so the models already pulled on this box are reused); -OllamaExe <path>; -TunnelId <uuid>
     -TunnelConfig <yml>   locally-managed tunnel: the config.yml to edit (auto-detected from the cloudflared service/task)
     -CfOnly               skip the Ollama/kit steps, only do the Cloudflare part (-GpuCount N when there is no kit config)
+    -NoUpgrade            never install a newer Ollama (stop with a message instead)
   ASCII only. No secrets inside: the token is only ever read from the parameter / environment at run time.
 #>
 [CmdletBinding()]
@@ -59,6 +63,7 @@ param(
     [switch]$NoCf,
     [switch]$NoModel,
     [switch]$CfOnly,
+    [switch]$NoUpgrade,
     [string]$ApiBase = $(if ($env:CF_API_BASE) { $env:CF_API_BASE } else { 'https://api.cloudflare.com/client/v4' })
 )
 $ErrorActionPreference = 'Stop'
@@ -72,7 +77,7 @@ if (-not $NoCf -and -not $CfToken -and [Environment]::UserInteractive) {
         $sec = Read-Host "Cloudflare API token (paste, input is hidden; just Enter = skip the tunnel/DNS/Access part)" -AsSecureString
         if ($sec -and $sec.Length -gt 0) {
             $b = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
-            try { $CfToken = [Runtime.InteropServices.Marshal]::PtrToStringAuto($b) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) }
+            try { $CfToken = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) }
         }
     } catch { $CfToken = '' }
     $CfToken = "$CfToken".Trim()
@@ -97,12 +102,61 @@ if (-not $CfOnly -and -not $OllamaExe) {
     $OllamaExe = $cands | Where-Object { Test-Path $_ } | Select-Object -First 1
     if (-not $OllamaExe) { $c = Get-Command ollama.exe -ErrorAction SilentlyContinue; if ($c) { $OllamaExe = $c.Source } }
 }
+function Get-OllamaVersion([string]$exe) {
+    $t = ''; try { $t = (& $exe --version 2>&1 | Out-String) } catch { $t = "$_" }
+    if ($t -match '(\d+)\.(\d+)\.(\d+)') { return [version]("{0}.{1}.{2}" -f $Matches[1], $Matches[2], $Matches[3]) }
+    return $null
+}
+function Update-Ollama() {
+    # downloads the current OllamaSetup.exe (Inno Setup, per-user, ~1-2 GB) and runs it silently. The installer kills a
+    # running ollama / tray app itself, keeps models + settings, then starts the tray app again (step 2 stops it).
+    $setup = Join-Path $env:TEMP 'OllamaSetup.exe'
+    $urls = @('https://ollama.com/download/OllamaSetup.exe', 'https://github.com/ollama/ollama/releases/latest/download/OllamaSetup.exe')
+    if ($env:WM_OLLAMA_SETUP_URL) { $urls = @($env:WM_OLLAMA_SETUP_URL -split ",") }   # tests only
+    $got = $false
+    foreach ($u in $urls) {
+        try {
+            Say "downloading $u -> $setup (1-2 GB, a few minutes) ..." 'Yellow'
+            if (Test-Path $setup) { Remove-Item $setup -Force }
+            $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+            if ($curl) {
+                & $curl.Source -L --fail --retry 3 --retry-delay 5 -# -o $setup $u
+                if ($LASTEXITCODE -ne 0) { throw "curl exit code $LASTEXITCODE" }
+            } else {
+                $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+                try { Invoke-WebRequest -Uri $u -OutFile $setup -UseBasicParsing } finally { $ProgressPreference = $pp }
+            }
+            $len = (Get-Item $setup).Length
+            if ($len -lt 50MB) { throw "downloaded file is only $len bytes (not the installer)" }
+            Say ("downloaded {0:N0} MB" -f ($len / 1MB)) 'Cyan'
+            $got = $true; break
+        } catch { Say "download failed: $($_.Exception.Message)" 'Yellow' }
+    }
+    if (-not $got) { return $false }
+    Say "installing silently (/VERYSILENT; the installer closes any running Ollama itself; 1-3 minutes) ..." 'Yellow'
+    $setupArgs = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
+    $code = -1
+    if ($env:WM_TEST_RUNNER) { & $env:WM_TEST_RUNNER $setup @setupArgs | Out-Host; $code = $LASTEXITCODE }   # tests only
+    else { $p = Start-Process -FilePath $setup -ArgumentList $setupArgs -Wait -PassThru; $code = $p.ExitCode }
+    if ($code -ne 0) { Say "installer exit code $code" 'Yellow'; return $false }
+    Start-Sleep -Seconds 8     # the installer launches the tray app on its way out; let it settle, step 2 stops it again
+    return $true
+}
 if (-not $CfOnly) {
     if (-not $OllamaExe -or -not (Test-Path $OllamaExe)) { Die "ollama.exe not found -- install Ollama (https://ollama.com/download/windows) or pass -OllamaExe" }
-    $verTxt = (& $OllamaExe --version 2>&1 | Out-String)
-    $ver = $null; if ($verTxt -match '(\d+)\.(\d+)\.(\d+)') { $ver = [version]("{0}.{1}.{2}" -f $Matches[1], $Matches[2], $Matches[3]) }
+    $ver = Get-OllamaVersion $OllamaExe
     Say ("ollama  : {0}  (version {1})" -f $OllamaExe, $(if ($ver) { $ver } else { '?' })) 'Cyan'
-    if ($ver -and $ver -lt $MinVer) { Die "Ollama $ver is too old for Qwen 3.8 (RENDERER qwen3.8 needs >= $MinVer, 'unknown renderer' otherwise). Install the latest from https://ollama.com/download/windows and re-run." }
+    if ($ver -and $ver -lt $MinVer) {
+        Say "Ollama $ver is too old for Qwen 3.8 (RENDERER qwen3.8 needs >= $MinVer, 'unknown renderer' otherwise)." 'Yellow'
+        if ($NoUpgrade) { Die "-NoUpgrade given: install the latest from https://ollama.com/download/windows yourself and re-run." }
+        if (-not (Update-Ollama)) { Die "automatic upgrade did not work -- install the latest from https://ollama.com/download/windows (OllamaSetup.exe, keeps the models) and re-run." }
+        $cands = @($OllamaExe, (Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe'), 'C:\Program Files\Ollama\ollama.exe')
+        $found = $cands | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+        if ($found) { $OllamaExe = $found }
+        $ver = Get-OllamaVersion $OllamaExe
+        Say ("ollama  : {0}  (version {1} after upgrade)" -f $OllamaExe, $(if ($ver) { $ver } else { '?' })) 'Cyan'
+        if (-not $ver -or $ver -lt $MinVer) { Die "still $ver after the upgrade -- run OllamaSetup.exe by hand (https://ollama.com/download/windows) and re-run." }
+    }
 }
 
 $gpus = @()
