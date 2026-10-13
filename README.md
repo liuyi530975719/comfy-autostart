@@ -108,7 +108,9 @@ powershell -ExecutionPolicy Bypass -File "$env:TEMP\node-ollama2.ps1"          #
 - Kit present (`C:\waifumaster-autostart`): writes the `ollama` block + v3 launcher (same as `add-ollama.ps1`, plus
   `ollama.env` = `OLLAMA_CONTEXT_LENGTH` / `OLLAMA_FLASH_ATTENTION` / `OLLAMA_KV_CACHE_TYPE` for every instance).
 - No kit: standalone `C:\waifumaster-ollama\` + scheduled task `WaifumasterOllama` (SYSTEM, at boot + keepalive every 2 min).
-- Needs Ollama >= 0.34.4 (Qwen 3.8 renderer). Stops the tray Ollama and its Startup entry (it would grab `:11434` unpinned).
+- Needs Ollama >= 0.34.4 (Qwen 3.8 renderer): an older one is upgraded in place (downloads the current `OllamaSetup.exe`,
+  silent install, models and settings kept; `-NoUpgrade` to refuse). Stops the tray Ollama and its Startup entry
+  (it would grab `:11434` unpinned).
 - Cloudflare (optional, API token with Zone DNS + Cloudflare Tunnel + Access edit): adds `<name>2.<zone>` -> `:11435`
   to the existing tunnel's ingress (remote config or local `config.yml`), the DNS CNAME and the Access app.
   `-Chat 6000chat -Zone bestyiever.vip` are the defaults; `-NoCf` to skip; `-CfOnly` to redo only the tunnel part.
